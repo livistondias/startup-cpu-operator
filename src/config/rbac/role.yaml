@@ -1,0 +1,42 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: startup-cpu-operator
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: startup-cpu-operator-role
+rules:
+- apiGroups: ["autoscaling.platform.io"]
+  resources: ["startupcpuboosts"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["autoscaling.platform.io"]
+  resources: ["startupcpuboosts/status"]
+  verbs: ["update", "patch"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch", "patch", "update"]
+- apiGroups: [""]
+  resources: ["pods/resize"]
+  verbs: ["update"]
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create", "patch"]
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: startup-cpu-operator-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: startup-cpu-operator-role
+subjects:
+- kind: ServiceAccount
+  name: startup-cpu-operator
+  namespace: kube-system

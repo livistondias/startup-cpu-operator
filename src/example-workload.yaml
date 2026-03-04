@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: oferta-app
+  labels:
+    app: oferta
+spec:
+  containers:
+  - name: oferta
+    image: your-app:latest
+    resources:
+      requests:
+        cpu: "1000m"
+      limits:
+        cpu: "1000m"
+    resizePolicy:
+    - resourceName: cpu
+      restartPolicy: NotRequired

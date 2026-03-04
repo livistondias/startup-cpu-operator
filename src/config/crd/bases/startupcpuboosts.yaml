@@ -1,0 +1,99 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: startupcpuboosts.autoscaling.platform.io
+spec:
+  group: autoscaling.platform.io
+  scope: Cluster
+  names:
+    kind: StartupCPUBoost
+    plural: startupcpuboosts
+    singular: startupcpuboost
+    shortNames:
+      - scpub
+    categories:
+      - autoscaling
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          required:
+            - spec
+          properties:
+            spec:
+              type: object
+              required:
+                - selector
+                - runtimeCPU
+                - warmupSeconds
+              properties:
+                selector:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                runtimeCPU:
+                  type: string
+                  pattern: '^([0-9]+m|[0-9]+(\.[0-9]+)?)$'
+                  description: "CPU request in Kubernetes format (e.g., 200m, 0.2)"
+                runtimeCPULimit:
+                  type: string
+                  pattern: '^([0-9]+m|[0-9]+(\.[0-9]+)?)$'
+                  description: "CPU limit in Kubernetes format. If empty, uses runtimeCPU value"
+                warmupSeconds:
+                  type: integer
+                  minimum: 0
+                  maximum: 3600
+                  description: "Time to wait after pod becomes ready before resizing"
+                containerName:
+                  type: string
+                  description: "Target container name. If empty, uses first container"
+            status:
+              type: object
+              properties:
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    required:
+                      - type
+                      - status
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                        enum: ["True", "False", "Unknown"]
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                observedGeneration:
+                  type: integer
+                podsProcessed:
+                  type: integer
+                lastReconcileTime:
+                  type: string
+                  format: date-time
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Runtime CPU
+          type: string
+          jsonPath: .spec.runtimeCPU
+        - name: CPU Limit
+          type: string
+          jsonPath: .spec.runtimeCPULimit
+        - name: Warmup
+          type: integer
+          jsonPath: .spec.warmupSeconds
+        - name: Pods Processed
+          type: integer
+          jsonPath: .status.podsProcessed
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp

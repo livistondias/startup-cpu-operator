@@ -1,0 +1,12 @@
+apiVersion: autoscaling.platform.io/v1
+kind: StartupCPUBoost
+metadata:
+  name: oferta-cpu-policy
+spec:
+  selector:
+    matchLabels:
+      app: oferta
+  runtimeCPU: "200m"
+  runtimeCPULimit: "400m"  # opcional, se omitido usa runtimeCPU
+  warmupSeconds: 120
+  containerName: oferta
