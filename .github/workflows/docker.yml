@@ -6,6 +6,7 @@ on:
     tags: ["v*.*.*"]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/startup-cpu-operator
@@ -45,7 +46,7 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
 
       - name: Build and push
         uses: docker/build-push-action@v5
