@@ -8,14 +8,18 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	autoscalingv1 "github.com/platform/startup-cpu-operator/api/v1"
 )
@@ -47,6 +51,7 @@ func NewStartupCPUBoostReconciler(client client.Client, scheme *runtime.Scheme, 
 // +kubebuilder:rbac:groups=autoscaling.platform.io,resources=startupcpuboosts,verbs=get;list;watch
 // +kubebuilder:rbac:groups=autoscaling.platform.io,resources=startupcpuboosts/status,verbs=update;patch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;patch
+// +kubebuilder:rbac:groups="",resources=pods/resize,verbs=update
 
 func (r *StartupCPUBoostReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
@@ -57,7 +62,7 @@ func (r *StartupCPUBoostReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	podsProcessed := int32(0)
-	
+
 	selector, err := metav1.LabelSelectorAsSelector(&policy.Spec.Selector)
 	if err != nil {
 		log.Error(err, "invalid selector", "policy", policy.Name)
@@ -88,7 +93,7 @@ func (r *StartupCPUBoostReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	now := metav1.Now()
 	policyUpdate := policy.DeepCopy()
-	policyUpdate.Status.PodsProcessed = podsProcessed
+	policyUpdate.Status.PodsProcessed = policy.Status.PodsProcessed + podsProcessed
 	policyUpdate.Status.LastReconcileTime = &now
 	policyUpdate.Status.ObservedGeneration = policy.Generation
 	if err := r.updateStatus(ctx, policyUpdate, "ReconcileSuccess", metav1.ConditionTrue, "Reconciliation completed"); err != nil {
@@ -106,10 +111,13 @@ func (r *StartupCPUBoostReconciler) updateStatus(ctx context.Context, policy *au
 		Message:            message,
 		LastTransitionTime: metav1.Now(),
 	}
-	
+
 	found := false
 	for i, c := range policy.Status.Conditions {
 		if c.Type == "Ready" {
+			if c.Status == condition.Status {
+				condition.LastTransitionTime = c.LastTransitionTime
+			}
 			policy.Status.Conditions[i] = condition
 			found = true
 			break
@@ -118,7 +126,7 @@ func (r *StartupCPUBoostReconciler) updateStatus(ctx context.Context, policy *au
 	if !found {
 		policy.Status.Conditions = append(policy.Status.Conditions, condition)
 	}
-	
+
 	return r.Status().Update(ctx, policy)
 }
 
@@ -151,7 +159,6 @@ func (r *StartupCPUBoostReconciler) processPod(ctx context.Context, pod *corev1.
 		return false, err
 	}
 
-	// Se RuntimeCPULimit não especificado, usa o mesmo valor do request
 	cpuLimit := cpuRequest
 	if policy.Spec.RuntimeCPULimit != "" {
 		cpuLimit, err = resource.ParseQuantity(policy.Spec.RuntimeCPULimit)
@@ -160,7 +167,6 @@ func (r *StartupCPUBoostReconciler) processPod(ctx context.Context, pod *corev1.
 		}
 	}
 
-	// Verificar se já está no valor desejado
 	containerIdx := 0
 	if policy.Spec.ContainerName != "" {
 		found := false
@@ -181,21 +187,23 @@ func (r *StartupCPUBoostReconciler) processPod(ctx context.Context, pod *corev1.
 		return false, nil
 	}
 
-	// Limitar patches simultâneos
 	r.resizeSemaphore <- struct{}{}
 	defer func() { <-r.resizeSemaphore }()
 
-	// Buscar Pod atualizado
 	podToUpdate, err := r.Clientset.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
 	if err != nil {
 		return false, err
 	}
 
-	// Atualizar resources
+	if podToUpdate.Spec.Containers[containerIdx].Resources.Requests == nil {
+		podToUpdate.Spec.Containers[containerIdx].Resources.Requests = corev1.ResourceList{}
+	}
+	if podToUpdate.Spec.Containers[containerIdx].Resources.Limits == nil {
+		podToUpdate.Spec.Containers[containerIdx].Resources.Limits = corev1.ResourceList{}
+	}
 	podToUpdate.Spec.Containers[containerIdx].Resources.Requests[corev1.ResourceCPU] = cpuRequest
 	podToUpdate.Spec.Containers[containerIdx].Resources.Limits[corev1.ResourceCPU] = cpuLimit
 
-	// Usar subresource /resize
 	result := r.Clientset.CoreV1().RESTClient().
 		Put().
 		Namespace(pod.Namespace).
@@ -209,25 +217,21 @@ func (r *StartupCPUBoostReconciler) processPod(ctx context.Context, pod *corev1.
 		return false, err
 	}
 
-	// Buscar pod atualizado após resize para evitar conflito de versão
 	updatedPod, err := r.Clientset.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
 	if err != nil {
 		log.Error(err, "failed to get pod after resize", "pod", pod.Name)
-		// Resize funcionou, apenas annotation falhou - não retornar erro
 		log.Info("CPU resized", "pod", pod.Name, "namespace", pod.Namespace, "cpu", policy.Spec.RuntimeCPU)
 		return true, nil
 	}
 
-	// Adicionar annotation após resize bem-sucedido
 	if updatedPod.Annotations == nil {
 		updatedPod.Annotations = make(map[string]string)
 	}
 	updatedPod.Annotations[ResizedAnnotation] = "true"
-	
+
 	_, err = r.Clientset.CoreV1().Pods(pod.Namespace).Update(ctx, updatedPod, metav1.UpdateOptions{})
 	if err != nil {
 		log.Error(err, "failed to add annotation after resize", "pod", pod.Name)
-		// Resize funcionou, apenas annotation falhou - não retornar erro
 	}
 
 	log.Info("CPU resized", "pod", pod.Name, "namespace", pod.Namespace, "cpu", policy.Spec.RuntimeCPU)
@@ -243,10 +247,34 @@ func isPodReady(pod *corev1.Pod) bool {
 	return false
 }
 
+// podToPolicy maps a Pod event to the StartupCPUBoost policies that select it.
+func (r *StartupCPUBoostReconciler) podToPolicy(ctx context.Context, obj client.Object) []reconcile.Request {
+	var policies autoscalingv1.StartupCPUBoostList
+	if err := r.List(ctx, &policies); err != nil {
+		return nil
+	}
+	var requests []reconcile.Request
+	for _, p := range policies.Items {
+		sel, err := metav1.LabelSelectorAsSelector(&p.Spec.Selector)
+		if err != nil {
+			continue
+		}
+		if sel.Matches(labels.Set(obj.GetLabels())) {
+			requests = append(requests, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: p.Name},
+			})
+		}
+	}
+	return requests
+}
+
 func (r *StartupCPUBoostReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&autoscalingv1.StartupCPUBoost{}).
-		Owns(&corev1.Pod{}).
+		Watches(
+			&corev1.Pod{},
+			handler.EnqueueRequestsFromMapFunc(r.podToPolicy),
+		).
 		WithOptions(controller.Options{
 			MaxConcurrentReconciles: 5,
 			RateLimiter: workqueue.NewItemExponentialFailureRateLimiter(
