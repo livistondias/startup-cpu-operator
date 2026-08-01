@@ -16,7 +16,7 @@ spec:
       serviceAccountName: startup-cpu-operator
       containers:
       - name: manager
-        image: startup-cpu-operator:latest
+        image: ghcr.io/livistondias/startup-cpu-operator:latest
         command:
         - /manager
         args:
