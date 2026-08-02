@@ -1,4 +1,4 @@
-# Startup CPU Operator
+# Startup CPU Boost Operator
 
 Kubernetes Operator que reduz automaticamente o CPU request/limit de Pods após o período de warmup usando In-Place Pod Resize (Kubernetes ≥ 1.33).
 
@@ -10,26 +10,58 @@ Aplicações como Java/JVM consomem muito CPU durante startup (~800-1200m) mas p
 
 Este operator aplica o padrão **Startup CPU Boost**:
 - Pod inicia com CPU alto
-- Após warmup, CPU é reduzido automaticamente
+- Após warmup, CPU é reduzido automaticamente via subresource `/resize`
 - Sem restart do Pod
 
-## Requisitos
+## Pré-requisitos
 
 - Kubernetes ≥ 1.33
-- Feature gate `InPlacePodVerticalScaling=true` (beta por padrão)
-- Go ≥ 1.22 (para desenvolvimento)
+- Feature gate `InPlacePodVerticalScaling=true` (beta, habilitado por padrão no K8s 1.33+)
+- `kubectl` configurado com acesso ao cluster
+
+### Verificar se o feature gate está ativo
+
+```bash
+kubectl get node -o jsonpath='{.items[0].status.allocatable}' | grep -c cpu
+# Se o cluster for < 1.33, o resize não funcionará
+
+# Verificar versão do cluster
+kubectl version --short
+```
+
+Se precisar habilitar manualmente (kubeadm):
+```bash
+# Em kube-apiserver e kubelet, adicionar:
+--feature-gates=InPlacePodVerticalScaling=true
+```
 
 ## Instalação
 
 ```bash
 # Instalar CRD
-kubectl apply -f src/config/crd/bases/startupcpuboosts.yaml
+kubectl apply -f https://raw.githubusercontent.com/livistondias/startup-cpu-operator/main/src/config/crd/bases/startupcpuboosts.yaml
 
 # Instalar RBAC
-kubectl apply -f src/config/rbac/role.yaml
+kubectl apply -f https://raw.githubusercontent.com/livistondias/startup-cpu-operator/main/src/config/rbac/role.yaml
 
 # Deploy do operator
-kubectl apply -f src/config/manager/deployment.yaml
+kubectl apply -f https://raw.githubusercontent.com/livistondias/startup-cpu-operator/main/src/config/manager/deployment.yaml
+```
+
+### Verificar se o operator subiu
+
+```bash
+kubectl rollout status deployment/startup-cpu-operator -n kube-system
+
+# Verificar logs
+kubectl logs -n kube-system deployment/startup-cpu-operator --tail=20
+```
+
+Saída esperada:
+```
+{"level":"info","msg":"starting manager"}
+{"level":"info","msg":"Starting EventSource"}
+{"level":"info","msg":"Starting Controller"}
 ```
 
 ## Uso
@@ -58,10 +90,12 @@ spec:
 - `containerName` - Nome do container alvo (opcional)
 
 ```bash
-kubectl apply -f example-policy.yaml
+kubectl apply -f https://raw.githubusercontent.com/livistondias/startup-cpu-operator/main/src/example-policy.yaml
 ```
 
 ### 2. Configurar workload
+
+> ⚠️ O Pod precisa declarar `resizePolicy` com `restartPolicy: NotRequired` para o resize funcionar sem reiniciar o container.
 
 ```yaml
 apiVersion: v1
@@ -72,19 +106,21 @@ metadata:
 spec:
   containers:
   - name: oferta
-    image: your-app:latest
+    image: eclipse-temurin:21-jre
     resources:
       requests:
         cpu: "1000m"
+        memory: "512Mi"
       limits:
         cpu: "1000m"
+        memory: "512Mi"
     resizePolicy:
     - resourceName: cpu
       restartPolicy: NotRequired
 ```
 
 ```bash
-kubectl apply -f example-workload.yaml
+kubectl apply -f https://raw.githubusercontent.com/livistondias/startup-cpu-operator/main/src/example-workload.yaml
 ```
 
 ### 3. Verificar status
@@ -95,15 +131,34 @@ kubectl get startupcpuboosts
 kubectl get scpub  # shortname
 
 # Output exemplo:
-# NAME                 RUNTIME CPU   CPU LIMIT   WARMUP   PODS PROCESSED   AGE
-# oferta-cpu-policy    200m          400m        120      5                10m
+# NAME                 RUNTIME CPU   WARMUP   PODS PROCESSED   AGE
+# oferta-cpu-policy    200m          120      5                10m
 
-# Ver detalhes
+# Ver detalhes e conditions
 kubectl describe startupcpuboost oferta-cpu-policy
-
-# Verificar pods processados
-kubectl get scpub -o wide
 ```
+
+### 4. Confirmar que o resize foi aplicado
+
+```bash
+# Ver CPU atual do pod após o warmup
+kubectl get pod oferta-app -o jsonpath='{.spec.containers[0].resources.requests.cpu}'
+# Esperado: 200m
+
+# Verificar annotation de controle
+kubectl get pod oferta-app -o jsonpath='{.metadata.annotations.startup-cpu-operator/resized}'
+# Esperado: true
+```
+
+## Desinstalação
+
+```bash
+kubectl delete -f https://raw.githubusercontent.com/livistondias/startup-cpu-operator/main/src/config/manager/deployment.yaml
+kubectl delete -f https://raw.githubusercontent.com/livistondias/startup-cpu-operator/main/src/config/rbac/role.yaml
+kubectl delete -f https://raw.githubusercontent.com/livistondias/startup-cpu-operator/main/src/config/crd/bases/startupcpuboosts.yaml
+```
+
+> Deletar o CRD remove automaticamente todos os objetos `StartupCPUBoost` do cluster.
 
 ## Desenvolvimento
 
@@ -116,6 +171,9 @@ make build
 # Run local (requer kubeconfig)
 make run
 
+# Testes
+make test
+
 # Build Docker
 make docker-build
 
@@ -123,17 +181,15 @@ make docker-build
 make deploy
 ```
 
-## Pipeline CI/CD
+## CI/CD
 
-O repositório inclui Azure Pipeline (`azure-pipelines.yml`) com 3 stages:
+O repositório usa **GitHub Actions** para build e push automático da imagem no GHCR:
 
-1. **Build** - Compila e testa o operator
-2. **Docker** - Build e push da imagem
-3. **Deploy** - Aplica no cluster Kubernetes
+- Push na `main` → publica `ghcr.io/livistondias/startup-cpu-operator:latest`
+- Tag `v1.2.3` → publica `1.2.3`, `1.2`, `1` e `latest`
+- Pull Request → apenas build (sem push)
 
-**Variáveis necessárias:**
-- `DOCKER_REGISTRY_CONNECTION` - Service connection do registry
-- `K8S_CONNECTION` - Service connection do cluster
+Build multi-arch: `linux/amd64` e `linux/arm64`.
 
 ## Como funciona
 
@@ -141,10 +197,10 @@ O repositório inclui Azure Pipeline (`azure-pipelines.yml`) com 3 stages:
 2. Para cada política, seleciona Pods usando label selector
 3. Valida se Pod está Running e Ready
 4. Aguarda `warmupSeconds` após Pod iniciar
-5. Executa patch em `spec.containers[].resources`
+5. Executa resize via subresource `/resize` (sem restart)
 6. Marca Pod com annotation `startup-cpu-operator/resized=true`
 7. Atualiza status da política com métricas
-8. Reconcilia a cada 30s ou quando há mudanças
+8. Reconcilia a cada 1 minuto ou em mudanças de Pod
 
 ## Observabilidade
 
@@ -160,7 +216,7 @@ Tipos:
 
 ### Métricas no Status
 
-- `podsProcessed` - Total de pods com resize aplicado
+- `podsProcessed` - Total acumulado de pods com resize aplicado
 - `observedGeneration` - Última geração reconciliada
 - `lastReconcileTime` - Timestamp da última reconciliação
 
@@ -194,6 +250,18 @@ kubectl get pod <pod-name> -o jsonpath='{.metadata.annotations}'
 kubectl logs -n kube-system deployment/startup-cpu-operator
 ```
 
+### Resize não funciona (sem erro nos logs)
+
+Verificar se o feature gate está habilitado no cluster:
+```bash
+kubectl get node -o yaml | grep -i inplace
+```
+
+Verificar se Pod tem `resizePolicy` configurado:
+```bash
+kubectl get pod <pod-name> -o jsonpath='{.spec.containers[0].resizePolicy}'
+```
+
 ### Container não encontrado
 
 Se especificar `containerName`, garantir que existe no Pod:
@@ -201,19 +269,12 @@ Se especificar `containerName`, garantir que existe no Pod:
 kubectl get pod <pod-name> -o jsonpath='{.spec.containers[*].name}'
 ```
 
-### Resize não funciona
-
-Verificar se Pod tem `resizePolicy`:
-```bash
-kubectl get pod <pod-name> -o jsonpath='{.spec.containers[0].resizePolicy}'
-```
-
 ## Limitações
 
 - Apenas CPU é suportado (não memory)
 - Resize ocorre apenas uma vez por Pod (via annotation)
 - Requer `resizePolicy.restartPolicy=NotRequired` no Pod
-- Scope Cluster (não Namespaced)
+- Scope Cluster (não Namespaced) — uma política afeta pods em qualquer namespace
 - Se `runtimeCPULimit` não especificado, limit = request
 
 ## Casos de uso
@@ -232,36 +293,25 @@ spec:
   runtimeCPULimit: "500m"
 ```
 
-**3. Múltiplos containers**
+**3. Container específico em pod multi-container**
 ```yaml
 spec:
-  containerName: "app"  # especifica qual container
+  containerName: "app"
   runtimeCPU: "100m"
 ```
 
 ## Arquitetura
 
 ```
-StartupCPUBoost (CRD)
+StartupCPUBoost (CRD, cluster-scoped)
         ↓
-Operator observa Pods
+Operator observa Pods via label selector
         ↓
-Pod Ready + warmup
+Pod Running + Ready + warmupSeconds decorridos
         ↓
-PATCH spec.containers[].resources
+PUT /resize → spec.containers[].resources
         ↓
-CPU reduzido (no restart)
+CPU reduzido sem restart
+        ↓
+Annotation resized=true + status atualizado
 ```
-
-## Critérios de aceitação
-
-✅ Pods iniciam com CPU alto  
-✅ Após warmup CPU é reduzido automaticamente  
-✅ Nenhum restart ocorre  
-✅ Resize ocorre apenas uma vez por Pod  
-✅ Operator suporta múltiplas políticas  
-✅ Status reporta métricas e conditions  
-✅ Validações robustas no CRD  
-✅ RBAC com permissões mínimas
-
-
