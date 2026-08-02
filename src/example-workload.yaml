@@ -7,12 +7,15 @@ metadata:
 spec:
   containers:
   - name: oferta
-    image: your-app:latest
+    image: eclipse-temurin:21-jre
+    command: ["sh", "-c", "sleep 3600"]
     resources:
       requests:
         cpu: "1000m"
+        memory: "512Mi"
       limits:
         cpu: "1000m"
+        memory: "512Mi"
     resizePolicy:
     - resourceName: cpu
       restartPolicy: NotRequired
